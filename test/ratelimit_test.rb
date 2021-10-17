@@ -113,6 +113,12 @@ module RatelimitTests
     assert_not_rate_limited app.call('c1' => false)
   end
 
+  def test_ban_options_as_config_options
+    app = build_ratelimiter(@app, ban_options)
+    assert_equal 200, app.call({}).first
+    assert_banned app.call({})
+  end
+
   def test_skip_rate_limiting_when_classifier_returns_nil
     app = build_ratelimiter(@app) { |env| env['c'] }
     assert_rate_limited app.call('c' => '1')
@@ -128,6 +134,10 @@ module RatelimitTests
       assert !response[1]['X-Ratelimit'].nil?
     end
 
+    def assert_banned(response)
+      assert_equal 403, response.first
+    end
+
     def build_ratelimiter(app, options = {}, &block)
       block ||= -> env { 'classification' } unless options.delete(:no_classifier)
       Rack::Ratelimit.new(app, ratelimit_options.merge(options), &block)
@@ -135,6 +145,25 @@ module RatelimitTests
 
     def ratelimit_options
       { rate: [1,10], logger: @logger }
+    end
+
+    def ban_options
+      return { ban_duration: 10 } unless [:redis, :cache, :banner].none? { |key| ratelimit_options.key? key }
+      { ban_duration: 10, banner: Banner.new }
+    end
+
+    class Banner
+      def initialize
+        @banners = {}
+      end
+    
+      def ban(classification)
+        @banners[classification] = true
+      end
+    
+      def banned?(classification)
+        !@banners[classification].nil?
+      end
     end
 end
 
