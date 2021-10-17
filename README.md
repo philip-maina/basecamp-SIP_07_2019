@@ -27,17 +27,17 @@ Required configuration:
 and one of
 * cache: a Dalli::Client instance
 * redis: a Redis instance
-* counter: Your own custom counter. Must respond to `#increment(classification_string, end_of_time_window_timestamp)` and return the counter value after increment.
+* counter: Your own custom counter.  
+  Must respond to 
+    * `#increment(classification_string, end_of_time_window_timestamp)` and return the counter value after increment.
 
 Optional configuration:
 * ban_duration: period in seconds a client should be banned when rate limit is exceeded.
 * banner: Your own custom banner. **This is required when counter configuration option 
-  is provided**
-    Must respond to
-      • `#ban(classification_string)` and return a truthy value after adding the client
-      to the list of banned clients.
-      • `#banned?(classification_string)` and return a boolean value indicating whether
-      a particular client has been banned from all requests.
+  is provided**.  
+  Must respond to
+    * `#ban(classification_string)` and return a truthy value after adding the client to the list of banned clients.
+    * `#banned?(classification_string)` and return a boolean value indicating whether a particular client has been banned from all requests.
 * name: name of the rate limiter. Defaults to 'HTTP'. Used in messages.
 * conditions: array of procs that take a rack env, all of which must
     return true to rate-limit the request.
