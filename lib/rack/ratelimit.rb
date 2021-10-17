@@ -29,6 +29,12 @@ module Rack
     #
     # Optional configuration:
     #   name: name of the rate limiter. Defaults to 'HTTP'. Used in messages.
+    #   ban_duration: period in seconds a client should be banned when rate limit is exceeded
+    #   banner: Your own custom banner. Must respond to
+    #     `#ban(classification_string)` - add classification_string to list of banned classification
+    #      strings; return a truthy value.
+    #     `#banned?(classification_string)` check if classification_string is in
+    #     list of banned classification strings; return a boolean value.
     #   status: HTTP response code. Defaults to 429.
     #   conditions: array of procs that take a rack env, all of which must
     #     return true to rate-limit the request.
@@ -58,6 +64,7 @@ module Rack
     #   use(Rack::Ratelimit, name: 'API',
     #     conditions: ->(env) { env['REMOTE_USER'] },
     #     rate:   [1000, 1.hour],
+    #     ban_duration: 24.hours,
     #     redis:  Redis.new(ratelimit_redis_config),
     #     logger: Rails.logger) { |env| env['REMOTE_USER'] }
     def initialize(app, options, &classifier)
@@ -67,6 +74,9 @@ module Rack
       @name = options.fetch(:name, 'HTTP')
       @max, @period = options.fetch(:rate)
       @status = options.fetch(:status, 429)
+
+      @ban_duration = options.fetch(:ban_duration, 0)
+      @banner       = set_banner(options) if bannable?
 
       @counter =
         if counter = options[:counter]
@@ -103,6 +113,28 @@ module Rack
       @exceptions << block if block_given?
     end
 
+    def set_banner(options)
+      if banner = options[:banner]
+        raise ArgumentError, 'Banner must respond to #ban' unless banner.respond_to?(:ban)
+        raise ArgumentError, 'Banner must respond to #banned?' unless banner.respond_to?(:banned?)
+        banner
+      elsif cache = options[:cache]
+        Banner::Memcached.new(cache, @name, @ban_duration)
+      elsif redis = options[:redis]
+        Banner::Redis.new(redis, @name, @ban_duration)
+      else
+        raise ArgumentError, ':cache, :redis, or :banner is required'
+      end  
+    end
+
+    def bannable?
+      @ban_duration > 0
+    end
+
+    def ban_response
+      [403, { 'Content-Type' => 'text/plain' }, ["Forbidden Access! \nYou don’t have permission to access this resource"]]
+    end
+
     # Apply the rate limiter if none of the exceptions apply and all the
     # conditions are met.
     def apply_rate_limit?(env)
@@ -123,39 +155,46 @@ module Rack
     #   * If it's the first request that exceeds the limit, log it.
     #   * If the count doesn't exceed the limit, pass through the request.
     def call(env)
+      classification = classify(env)
+      
+      return ban_response   if bannable? && classification && @banner.banned?(classification)
+      return @app.call(env) unless apply_rate_limit?(env) && classification
+      
       # Accept an optional start-of-request timestamp from the Rack env for
       # upstream timing and for testing.
       now = env.fetch('ratelimit.timestamp', Time.now).to_f
 
-      if apply_rate_limit?(env) && classification = classify(env)
-        # Increment the request counter.
-        epoch = ratelimit_epoch(now)
-        count = @counter.increment(classification, epoch)
-        remaining = @max - count
+      # Increment the request counter.
+      epoch     = ratelimit_epoch(now)
+      count     = @counter.increment(classification, epoch)
+      remaining = @max - count
 
-        # If exceeded, return a 429 Rate Limit Exceeded response.
-        if remaining < 0
-          # Only log the first hit that exceeds the limit.
-          if @logger && remaining == -1
-            @logger.info '%s: %s exceeded %d request limit for %s' % [@name, classification, @max, format_epoch(epoch)]
-          end
-
-          retry_after = seconds_until_epoch(epoch)
-
-          [ @status,
-            { 'X-Ratelimit' => ratelimit_json(remaining, epoch),
-              'Retry-After' => retry_after.to_s },
-            [ @error_message % retry_after ] ]
-
-        # Otherwise, pass through then add some informational headers.
-        else
-          @app.call(env).tap do |status, headers, body|
-            amend_headers headers, 'X-Ratelimit', ratelimit_json(remaining, epoch)
-          end
+      # If exceeded, return a 429 Rate Limit Exceeded response.
+      if remaining < 0
+        # Ban Client (if indicated)
+        if bannable?
+          @banner.ban(classification)
+          return ban_response
         end
+    
+        # Only log the first hit that exceeds the limit.
+        if @logger && remaining == -1
+          @logger.info '%s: %s exceeded %d request limit for %s' % [@name, classification, @max, format_epoch(epoch)]
+        end
+
+        retry_after = seconds_until_epoch(epoch)
+
+        [ @status,
+          { 'X-Ratelimit' => ratelimit_json(remaining, epoch),
+            'Retry-After' => retry_after.to_s },
+          [ @error_message % retry_after ] ]
+
+      # Otherwise, pass through then add some informational headers.
       else
-        @app.call(env)
-      end
+        @app.call(env).tap do |status, headers, body|
+          amend_headers headers, 'X-Ratelimit', ratelimit_json(remaining, epoch)
+        end
+      end 
     end
 
     private
@@ -182,6 +221,42 @@ module Rack
       def amend_headers(headers, name, value)
         headers[name] = [headers[name], value].compact.join("\n")
       end
+
+    class Banner
+      attr_reader :cache, :name, :ban_duration
+                
+      def initialize(cache, name, ban_duration)
+        @cache, @name, @ban_duration = cache, name, ban_duration
+      end
+
+      def banned?(classification)
+        !cache.get(key(classification)).nil?
+      end
+
+      private
+        def key(classification)
+          'rack-ratelimit/%s/%s' % [name, classification]
+        end
+    end
+
+    class Banner::Redis < Banner
+      def ban(classification)
+        cache.multi do
+          cache.set(key(classification), 1)
+          cache.expire(key(classification), ban_duration)
+        end
+      rescue Redis::BaseError
+        0
+      end
+    end
+
+    class Banner::Memcached < Banner
+      def ban(classification)
+        cache.set(key(classification), 1, ban_duration)
+      rescue Dalli::DalliError
+        0
+      end
+    end
 
     class MemcachedCounter
       def initialize(cache, name, period)
