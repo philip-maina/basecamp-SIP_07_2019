@@ -12,8 +12,10 @@ module Rack
   # * Fast, low-overhead implementation using counters per time window:
   #     timeslice = window * ceiling(current time / window)
   #     store.incr(timeslice)
+  # * Choose to ban a client for a given time interval, for all requests, if rate limit is exceeded.
   class Ratelimit
-    # Takes a block that classifies requests for rate limiting. Given a
+    # Takes a block that classifies requests for rate limiting with the possibility
+    # of banning all requests that exceed the specified rate limit. Given a
     # Rack env, return a string such as IP address, API token, etc. If the
     # block returns nil, the request won't be rate-limited. If a block is
     # not given, all requests get the same limits.
@@ -23,18 +25,23 @@ module Rack
     # and one of
     #   cache: a Dalli::Client instance
     #   redis: a Redis instance
-    #   counter: Your own custom counter. Must respond to
-    #     `#increment(classification_string, end_of_time_window_epoch_timestamp)`
-    #     and return the counter value after increment.
+    #   counter [DEPRECATED (use persister instead)]: Your own custom counter. 
+    #     Must respond to
+    #       `#increment(classification_string, end_of_time_window_epoch_timestamp)`
+    #       and return the counter value after increment.
+    #   persister: Your own custom persister. 
+    #     Must respond to 
+    #       `#increment(classification_string, end_of_time_window_epoch_timestamp)`
+    #       and return the counter value after increment.
+    #     If ban_duration is set, must also respond to
+    #       `#ban(classification_string)` - add classification_string to list of banned classification
+    #        strings; return a truthy value.
+    #       `#banned?(classification_string)` check if classification_string is in
+    #       list of banned classification_strings; return a boolean value.
     #
     # Optional configuration:
     #   name: name of the rate limiter. Defaults to 'HTTP'. Used in messages.
     #   ban_duration: period in seconds a client should be banned when rate limit is exceeded
-    #   banner: Your own custom banner. Must respond to
-    #     `#ban(classification_string)` - add classification_string to list of banned classification
-    #      strings; return a truthy value.
-    #     `#banned?(classification_string)` check if classification_string is in
-    #     list of banned classification strings; return a boolean value.
     #   status: HTTP response code. Defaults to 429.
     #   conditions: array of procs that take a rack env, all of which must
     #     return true to rate-limit the request.
@@ -75,24 +82,12 @@ module Rack
       @max, @period = options.fetch(:rate)
       @status = options.fetch(:status, 429)
 
-      @ban_duration = options.fetch(:ban_duration, 0)
-      @banner       = set_banner(options) if bannable?
-
-      @counter =
-        if counter = options[:counter]
-          raise ArgumentError, 'Counter must respond to #increment' unless counter.respond_to?(:increment)
-          counter
-        elsif cache = options[:cache]
-          MemcachedCounter.new(cache, @name, @period)
-        elsif redis = options[:redis]
-          RedisCounter.new(redis, @name, @period)
-        else
-          raise ArgumentError, ':cache, :redis, or :counter is required'
-        end
-
-      @logger = options[:logger]
+      @logger        = options[:logger]
       @error_message = options.fetch(:error_message, "#{@name} rate limit exceeded. Please wait %d seconds then retry your request.")
 
+      @ban_duration = options.fetch(:ban_duration, 0)
+      @persister    = get_persister(options)
+      
       @conditions = Array(options[:conditions])
       @exceptions = Array(options[:exceptions])
     end
@@ -113,18 +108,32 @@ module Rack
       @exceptions << block if block_given?
     end
 
-    def set_banner(options)
-      if banner = options[:banner]
-        raise ArgumentError, 'Banner must respond to #ban' unless banner.respond_to?(:ban)
-        raise ArgumentError, 'Banner must respond to #banned?' unless banner.respond_to?(:banned?)
-        banner
-      elsif cache = options[:cache]
-        Banner::Memcached.new(cache, @name, @ban_duration)
-      elsif redis = options[:redis]
-        Banner::Redis.new(redis, @name, @ban_duration)
-      else
-        raise ArgumentError, ':cache, :redis, or :banner is required'
-      end  
+    def get_persister(options)
+      return get_counter(options[:counter])           if options[:counter]
+      return get_memcached_persister(options[:cache]) if options[:cache]
+      return get_redis_persister(options[:redis])     if options[:redis] 
+
+      raise ArgumentError, '`:persister`,`:cache`,`:redis` or `:counter` is required' unless persister = options[:persister]
+      raise ArgumentError, 'Persister must respond to #increment' unless persister.respond_to?(:increment)
+      raise ArgumentError, 'Persister must respond to #ban'       unless persister.respond_to?(:ban)
+      raise ArgumentError, 'Persister must respond to #banned?'   unless persister.respond_to?(:banned?)
+
+      persister
+    end
+
+    def get_counter(counter)
+      @logger.warn 'DEPRECATION WARNING: `:counter` is deprecated and will be removed in future releases (use `:persister` instead)'
+      raise ArgumentError, '`:counter` cannot be used with `:ban_duration`. Please prefer `:persister`' if bannable?
+      raise ArgumentError, 'Counter must respond to #increment' unless counter.respond_to?(:increment)
+      counter
+    end
+
+    def get_memcached_persister(cache)
+      Persister::Memcached.new(cache, @name, @period, @ban_duration)
+    end
+
+    def get_redis_persister(redis)
+      Persister::Redis.new(redis, @name, @period, @ban_duration)
     end
 
     def bannable?
@@ -157,7 +166,7 @@ module Rack
     def call(env)
       classification = classify(env)
       
-      return ban_response   if bannable? && classification && @banner.banned?(classification)
+      return ban_response   if bannable? && classification && @persister.banned?(classification)
       return @app.call(env) unless apply_rate_limit?(env) && classification
       
       # Accept an optional start-of-request timestamp from the Rack env for
@@ -166,14 +175,14 @@ module Rack
 
       # Increment the request counter.
       epoch     = ratelimit_epoch(now)
-      count     = @counter.increment(classification, epoch)
+      count     = @persister.increment(classification, epoch)
       remaining = @max - count
 
       # If exceeded, return a 429 Rate Limit Exceeded response.
       if remaining < 0
         # Ban Client (if indicated)
         if bannable?
-          @banner.ban(classification)
+          @persister.ban(classification)
           return ban_response
         end
     
@@ -222,84 +231,77 @@ module Rack
         headers[name] = [headers[name], value].compact.join("\n")
       end
 
-    class Banner
-      attr_reader :cache, :name, :ban_duration
+    class Persister
+      attr_reader :client, :name, :period, :ban_duration
                 
-      def initialize(cache, name, ban_duration)
-        @cache, @name, @ban_duration = cache, name, ban_duration
+      def initialize(client, name, period, ban_duration)
+        @client, @name, @period, @ban_duration = client, name, period, ban_duration
       end
 
       def banned?(classification)
-        !cache.get(key(classification)).nil?
+        !client.get(ban_key(classification)).nil?
       end
 
       private
-        def key(classification)
+        def ban_key(classification)
           'rack-ratelimit/%s/%s' % [name, classification]
         end
-    end
 
-    class Banner::Redis < Banner
-      def ban(classification)
-        cache.multi do
-          cache.set(key(classification), 1)
-          cache.expire(key(classification), ban_duration)
+        def increment_key(classification, epoch)
+          'rack-ratelimit/%s/%s/%i' % [name, classification, epoch]
         end
-      rescue Redis::BaseError
-        0
-      end
     end
 
-    class Banner::Memcached < Banner
+    class Persister::Redis < Persister
       def ban(classification)
-        cache.set(key(classification), 1, ban_duration)
-      rescue Dalli::DalliError
-        0
-      end
-    end
+        key = ban_key(classification)
 
-    class MemcachedCounter
-      def initialize(cache, name, period)
-        @cache, @name, @period = cache, name, period
+        client.multi do
+          client.set(key, 1)
+          client.expire(key, ban_duration)
+        end
+      rescue ::Redis::BaseError
+        0
       end
 
       # Increment the request counter and return the current count.
       def increment(classification, epoch)
-        key = 'rack-ratelimit/%s/%s/%i' % [@name, classification, epoch]
+        key = increment_key(classification, epoch)
+
+        # Returns [count, expire_ok] response for each multi command.
+        # Return the first, the count.
+        client.multi do |redis|
+          client.incr key
+          client.expire key, period
+        end.first
+      rescue ::Redis::BaseError
+        0
+      end
+    end
+
+    class Persister::Memcached < Persister
+      def ban(classification)
+        client.set(ban_key(classification), 1, ban_duration)
+      rescue ::Dalli::DalliError
+        0
+      end
+
+      def increment(classification, epoch)
+        key = increment_key(classification, epoch)
 
         # Try to increment the counter if it's present.
-        if count = @cache.incr(key, 1)
+        if count = client.incr(key, 1)
           count.to_i
 
         # If not, add the counter and set expiry.
-        elsif @cache.add(key, 1, @period, :raw => true)
+        elsif client.add(key, 1, period, :raw => true)
           1
 
         # If adding failed, someone else added it concurrently. Increment.
         else
-          @cache.incr(key, 1).to_i
+          client.incr(key, 1).to_i
         end
-      rescue Dalli::DalliError
-        0
-      end
-    end
-
-    class RedisCounter
-      def initialize(redis, name, period)
-        @redis, @name, @period = redis, name, period
-      end
-
-      # Increment the request counter and return the current count.
-      def increment(classification, epoch)
-        key = 'rack-ratelimit/%s/%s/%i' % [@name, classification, epoch]
-
-        # Returns [count, expire_ok] response for each multi command.
-        # Return the first, the count.
-        @redis.multi do |redis|
-          redis.incr key
-          redis.expire key, @period
-        end.first
-      rescue Redis::BaseError
+      rescue ::Dalli::DalliError
         0
       end
     end
