@@ -28,7 +28,6 @@ module RatelimitTests
     assert_equal 200, status
     assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*"}), headers['X-Ratelimit']
     assert_equal [], body
-    assert_equal '', @out.string
   end
 
   def test_decrements_rate_limit_header_remaining_count
@@ -45,7 +44,6 @@ module RatelimitTests
     assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*"}), info.first
     assert_match %r({"name":"two","period":10,"limit":1,"remaining":0,"until":".*"}), info.last
     assert_equal [], body
-    assert_equal '', @out.string
   end
 
   def test_responds_with_429_if_request_rate_exceeds_limit
@@ -138,6 +136,19 @@ module RatelimitTests
     end
 end
 
+module BanTests
+  def test_ban_options_as_config_options
+    app = build_ratelimiter(@app, ban_duration: 10)
+    assert_equal 200, app.call({}).first
+    assert_banned app.call({})
+  end
+
+  private
+    def assert_banned(response)
+      assert_equal 403, response.first
+    end
+end
+
 module RatelimitBackendExceptionTests
   def test_skip_tracking_on_backend_errors
     app = Rack::Ratelimit.new \
@@ -161,7 +172,7 @@ class RequiredBackendTest < Minitest::Test
 end
 
 class MemcachedRatelimitTest < Minitest::Test
-  include RatelimitTests, RatelimitBackendExceptionTests
+  include RatelimitTests, RatelimitBackendExceptionTests, BanTests
 
   def setup
     @cache = Dalli::Client.new('localhost:11211').tap(&:flush)
@@ -186,7 +197,7 @@ class MemcachedRatelimitTest < Minitest::Test
 end
 
 class RedisRatelimitTest < Minitest::Test
-  include RatelimitTests, RatelimitBackendExceptionTests
+  include RatelimitTests, RatelimitBackendExceptionTests, BanTests
 
   def setup
     @redis = Redis.new(:host => 'localhost', :port => 6379, :db => 0).tap(&:flushdb)
@@ -213,6 +224,12 @@ end
 class CustomCounterRatelimitTest < Minitest::Test
   include RatelimitTests
 
+  def test_counter_is_incompatible_with_ban_options
+    assert_raises ArgumentError do
+      build_ratelimiter(nil, ban_duration: 10)
+    end
+  end
+
   private
     def ratelimit_options
       super.merge counter: Counter.new
@@ -225,6 +242,38 @@ class CustomCounterRatelimitTest < Minitest::Test
           timeslices[timestamp] = 0
         end
       end
+    end
+
+    def increment(classification, timestamp)
+      @counters[classification][timestamp] += 1
+    end
+  end
+end
+
+class CustomPersisterRatelimitTest < Minitest::Test
+  include RatelimitTests, BanTests
+
+  private
+    def ratelimit_options
+      super.merge persister: Persister.new
+    end
+
+  class Persister
+    def initialize
+      @banners = {}
+      @counters = Hash.new do |classifications, name|
+        classifications[name] = Hash.new do |timeslices, timestamp|
+          timeslices[timestamp] = 0
+        end
+      end
+    end
+
+    def ban(classification)
+      @banners[classification] = 1
+    end
+
+    def banned?(classification)
+      !@banners[classification].nil?
     end
 
     def increment(classification, timestamp)
